@@ -100,7 +100,8 @@ public:
     const rclcpp::Time & sample_time,
     const interpolation_methods::InterpolationMethod interpolation_method,
     trajectory_msgs::msg::JointTrajectoryPoint & output_state,
-    TrajectoryPointConstIter & start_segment_itr, TrajectoryPointConstIter & end_segment_itr);
+    TrajectoryPointConstIter & start_segment_itr, TrajectoryPointConstIter & end_segment_itr,
+    const std::vector<rclcpp::Duration> &joint_delays = std::vector<rclcpp::Duration>());
 
   /**
    * Do interpolation between 2 states given a time in between their respective timestamps
@@ -121,13 +122,15 @@ public:
    * \param[in] time_b Time at which the segment state equals \p state_b.
    * \param[in] state_b State at time \p time_b.
    * \param[in] sample_time The time to sample, between time_a and time_b.
+   * \param[in] i Joint index to interpolate. If -1, all joints are interpolated.
    * \param[out] output The state at \p sample_time.
    */
   JOINT_TRAJECTORY_CONTROLLER_PUBLIC
   void interpolate_between_points(
     const rclcpp::Time & time_a, const trajectory_msgs::msg::JointTrajectoryPoint & state_a,
     const rclcpp::Time & time_b, const trajectory_msgs::msg::JointTrajectoryPoint & state_b,
-    const rclcpp::Time & sample_time, trajectory_msgs::msg::JointTrajectoryPoint & output);
+    const rclcpp::Time & sample_time, trajectory_msgs::msg::JointTrajectoryPoint & output,
+    int joint_i = -1);
 
   JOINT_TRAJECTORY_CONTROLLER_PUBLIC
   TrajectoryPointConstIter begin() const;
@@ -165,7 +168,8 @@ private:
   void deduce_from_derivatives(
     trajectory_msgs::msg::JointTrajectoryPoint & first_state,
     trajectory_msgs::msg::JointTrajectoryPoint & second_state, const size_t dim,
-    const double delta_t);
+    const double delta_t,
+    int joint_i = -1);
 
   std::shared_ptr<trajectory_msgs::msg::JointTrajectory> trajectory_msg_;
   rclcpp::Time trajectory_start_time_;

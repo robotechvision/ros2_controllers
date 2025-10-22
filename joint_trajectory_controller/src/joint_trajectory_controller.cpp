@@ -218,7 +218,7 @@ controller_interface::return_type JointTrajectoryController::update(
     // find segment for current timestamp
     TrajectoryPointConstIter start_segment_itr, end_segment_itr;
     const bool valid_point = traj_external_point_ptr_->sample(
-      time, interpolation_method_, state_desired_, start_segment_itr, end_segment_itr);
+      time, interpolation_method_, state_desired_, start_segment_itr, end_segment_itr, state_joint_delays_);
 
     if (valid_point)
     {
@@ -234,7 +234,10 @@ controller_interface::return_type JointTrajectoryController::update(
       bool tolerance_violated_while_moving = false;
       bool outside_goal_tolerance = false;
       bool within_goal_time = true;
-      const bool before_last_point = end_segment_itr != traj_external_point_ptr_->end();
+      bool before_last_point = end_segment_itr != traj_external_point_ptr_->end();
+      // RCLCPP_INFO(LOGGER, "Before last point %d (%lu of %lu)", (int)before_last_point,
+      //             std::distance(traj_external_point_ptr_->begin(), end_segment_itr),
+      //             std::distance(traj_external_point_ptr_->begin(), traj_external_point_ptr_->end()));
       auto active_tol = active_tolerances_.readFromRT();
 
       // have we reached the end, are not holding position, and is a timeout configured?
@@ -249,29 +252,76 @@ controller_interface::return_type JointTrajectoryController::update(
         traj_msg_external_point_ptr_.initRT(set_hold_position());
       }
 
+      bool all_effort_limits_reached = has_effort_state_interface_ && state_desired_.effort.size() == dof_;
+      if (all_effort_limits_reached && !rt_is_holding_)
+        RCLCPP_INFO_STREAM(LOGGER, "State desired:\n" << trajectory_msgs::msg::to_yaml(state_desired_) << "\n"
+                                                      << "State current:\n" << trajectory_msgs::msg::to_yaml(state_current_));
+      std::vector<bool> reached_effort_limits(dof_, false);
       // Check state/goal tolerance
       for (size_t index = 0; index < dof_; ++index)
       {
+        if (has_effort_state_interface_ && state_desired_.effort.size() == dof_ && !rt_is_holding_)
+        {
+          // the state_desired_.effort serves as an effort limit. If the current effort
+          // exceeds this limit, we freeze the state_desired_ of the particular joint
+          if (state_desired_.effort[index] >= 0.0 ?
+                state_current_.effort[index] > state_desired_.effort[index] :
+                state_current_.effort[index] < state_desired_.effort[index])
+          {
+            reached_effort_limits[index] = true;
+            RCLCPP_INFO(
+              logger,
+              "Effort limit exceeded on joint '%s': current effort %lf (limit %lf). Freezing "
+              "desired state for this joint. Delay: %lf + (%lf - %lf) = %lf",
+              params_.joints[index].c_str(), state_current_.effort[index],
+              state_desired_.effort[index],
+              state_joint_delays_[index].seconds(),
+              rclcpp::Duration(state_desired_.time_from_start).seconds(),
+              rclcpp::Duration(last_commanded_state_.time_from_start).seconds(),
+              first_sample ? 0.0 :
+                (state_joint_delays_[index] + rclcpp::Duration(state_desired_.time_from_start) - rclcpp::Duration(last_commanded_state_.time_from_start)).seconds()
+              );
+            // freeze desired state for this joint
+            state_desired_.positions[index] = last_commanded_state_.positions[index];
+            state_desired_.velocities[index] = 0.0;
+            state_desired_.accelerations[index] = 0.0;
+
+            if (!first_sample)
+              state_joint_delays_[index] = state_joint_delays_[index] +
+                  rclcpp::Duration(state_desired_.time_from_start) - rclcpp::Duration(last_commanded_state_.time_from_start);
+          }
+          else
+          {
+            all_effort_limits_reached = false;
+          }
+        }
         compute_error_for_joint(state_error_, index, state_current_, state_desired_);
 
         // Always check the state tolerance on the first sample in case the first sample
         // is the last point
         // print output per default, goal will be aborted afterwards
         if (
-          (before_last_point || first_sample) && !rt_is_holding_ &&
+          (before_last_point || first_sample) && !rt_is_holding_ && !reached_effort_limits[index] &&
           !check_state_tolerance_per_joint(
             state_error_, index, active_tol->state_tolerance[index], true /* show_errors */))
         {
           tolerance_violated_while_moving = true;
+          RCLCPP_ERROR(
+            logger,
+            "State tolerance violated on joint '%s': position error %lf (tolerance %lf), "
+            "velocity error %lf (tolerance %lf)",
+            params_.joints[index].c_str(), state_error_.positions[index],
+            active_tol->state_tolerance[index].position, state_error_.velocities[index],
+            active_tol->state_tolerance[index].velocity);
         }
         // past the final point, check that we end up inside goal tolerance
         if (
-          !before_last_point && !rt_is_holding_ &&
+          !before_last_point && !rt_is_holding_ && !reached_effort_limits[index] &&
           !check_state_tolerance_per_joint(
             state_error_, index, active_tol->goal_state_tolerance[index], false /* show_errors */))
         {
           outside_goal_tolerance = true;
-
+          // RCLCPP_INFO(logger, "Time difference: %lf / %lf", time_difference, active_tol->goal_time_tolerance);
           if (active_tol->goal_time_tolerance != 0.0)
           {
             // if we exceed goal_time_tolerance set it to aborted
@@ -286,19 +336,30 @@ controller_interface::return_type JointTrajectoryController::update(
           }
         }
       }
+      // if all effort limits are reached, we consider the goal reached
+      if (all_effort_limits_reached)
+      {
+        RCLCPP_INFO(logger, "All effort limits reached. Considering goal reached.");
+      }
 
       // set values for next hardware write() if tolerance is met
-      if (!tolerance_violated_while_moving && within_goal_time)
-      {
+      // if (!tolerance_violated_while_moving && within_goal_time)
+      // {
         if (use_closed_loop_pid_adapter_)
         {
           // Update PIDs
           for (auto i = 0ul; i < dof_; ++i)
           {
             tmp_command_[i] = (state_desired_.velocities[i] * ff_velocity_scale_[i]) +
+                              // (has_effort_command_interface_ ? state_desired_.effort[i] : 0.0) +
                               pids_[i]->computeCommand(
                                 state_error_.positions[i], state_error_.velocities[i],
                                 (uint64_t)period.nanoseconds());
+            double pe, ie, de;
+            pids_[i]->getCurrentPIDErrors(pe, ie, de);
+            // RCLCPP_INFO(LOGGER, "%lu: error %lf (%lf - %lf) %lf, PIDS: %lf %lf %lf, cmd: %lf -> %lf", i, state_error_.positions[i],
+            //             state_desired_.positions[i], state_current_.positions[i],
+            //             state_error_.velocities[i], pe, ie, de, pids_[i]->getCurrentCmd(), tmp_command_[i]);
           }
         }
 
@@ -329,7 +390,7 @@ controller_interface::return_type JointTrajectoryController::update(
 
         // store the previous command. Used in open-loop control mode
         last_commanded_state_ = state_desired_;
-      }
+      // }
 
       if (active_goal)
       {
@@ -361,9 +422,9 @@ controller_interface::return_type JointTrajectoryController::update(
           traj_msg_external_point_ptr_.initRT(set_hold_position());
         }
         // check goal tolerance
-        else if (!before_last_point)
+        else if (!before_last_point || all_effort_limits_reached)
         {
-          if (!outside_goal_tolerance)
+          if (!outside_goal_tolerance || all_effort_limits_reached)
           {
             auto result = std::make_shared<FollowJTrajAction::Result>();
             result->set__error_code(FollowJTrajAction::Result::SUCCESSFUL);
@@ -377,7 +438,7 @@ controller_interface::return_type JointTrajectoryController::update(
             RCLCPP_INFO(logger, "Goal reached, success!");
 
             traj_msg_external_point_ptr_.reset();
-            traj_msg_external_point_ptr_.initRT(set_success_trajectory_point());
+            traj_msg_external_point_ptr_.initRT(set_success_trajectory_point(reached_effort_limits));
           }
           else if (!within_goal_time)
           {
@@ -459,6 +520,14 @@ void JointTrajectoryController::read_state_from_state_interfaces(JointTrajectory
     // Make empty so the property is ignored during interpolation
     state.velocities.clear();
     state.accelerations.clear();
+  }
+  if (has_effort_state_interface_ && state.effort.size() == dof_)
+  {
+    assign_point_from_interface(state.effort, joint_state_interface_.back());
+  }
+  else
+  {
+    state.effort.clear();
   }
 }
 
@@ -775,6 +844,8 @@ controller_interface::CallbackReturn JointTrajectoryController::on_configure(
     contains_interface_type(params_.state_interfaces, hardware_interface::HW_IF_VELOCITY);
   has_acceleration_state_interface_ =
     contains_interface_type(params_.state_interfaces, hardware_interface::HW_IF_ACCELERATION);
+  has_effort_state_interface_ =
+    contains_interface_type(params_.state_interfaces, hardware_interface::HW_IF_EFFORT);
 
   // Validation of combinations of state and velocity together have to be done
   // here because the parameter validators only deal with each parameter
@@ -790,17 +861,17 @@ controller_interface::CallbackReturn JointTrajectoryController::on_configure(
     return CallbackReturn::FAILURE;
   }
 
-  // effort is always used alone so no need for size check
-  if (
-    has_effort_command_interface_ &&
-    (!has_velocity_state_interface_ || !has_position_state_interface_))
-  {
-    RCLCPP_ERROR(
-      logger,
-      "'effort' command interface can only be used alone if 'velocity' and "
-      "'position' state interfaces are present");
-    return CallbackReturn::FAILURE;
-  }
+  // // effort is always used alone so no need for size check
+  // if (
+  //   has_effort_command_interface_ &&
+  //   (!has_velocity_state_interface_ || !has_position_state_interface_))
+  // {
+  //   RCLCPP_ERROR(
+  //     logger,
+  //     "'effort' command interface can only be used alone if 'velocity' and "
+  //     "'position' state interfaces are present");
+  //   return CallbackReturn::FAILURE;
+  // }
 
   auto get_interface_list = [](const std::vector<std::string> & interface_types)
   {
@@ -936,10 +1007,14 @@ controller_interface::CallbackReturn JointTrajectoryController::on_configure(
     std::bind(&JointTrajectoryController::goal_accepted_callback, this, _1));
 
   resize_joint_trajectory_point(state_current_, dof_);
+  if (has_effort_state_interface_)
+    state_current_.effort.resize(dof_);
   resize_joint_trajectory_point_command(command_current_, dof_);
   resize_joint_trajectory_point(state_desired_, dof_);
   resize_joint_trajectory_point(state_error_, dof_);
   resize_joint_trajectory_point(last_commanded_state_, dof_);
+
+  state_joint_delays_.resize(dof_, rclcpp::Duration::from_seconds(0));
 
   query_state_srv_ = get_node()->create_service<control_msgs::srv::QueryTrajectoryState>(
     std::string(get_node()->get_name()) + "/query_state",
@@ -1569,13 +1644,13 @@ bool JointTrajectoryController::validate_trajectory_msg(
     {
       return false;
     }
-    // reject effort entries
-    if (!points[i].effort.empty())
-    {
-      RCLCPP_ERROR(
-        get_node()->get_logger(), "Trajectories with effort fields are currently not supported.");
-      return false;
-    }
+    // // reject effort entries
+    // if (!points[i].effort.empty())
+    // {
+    //   RCLCPP_ERROR(
+    //     get_node()->get_logger(), "Trajectories with effort fields are currently not supported.");
+    //   return false;
+    // }
   }
   return true;
 }
@@ -1584,6 +1659,9 @@ void JointTrajectoryController::add_new_trajectory_msg(
   const std::shared_ptr<trajectory_msgs::msg::JointTrajectory> & traj_msg)
 {
   traj_msg_external_point_ptr_.writeFromNonRT(traj_msg);
+  for (auto &state_delay : state_joint_delays_)
+    state_delay = rclcpp::Duration::from_seconds(0);
+  RCLCPP_INFO_STREAM(LOGGER, "New traj\n" << trajectory_msgs::msg::to_yaml(*traj_msg));
 }
 
 void JointTrajectoryController::preempt_active_goal()
@@ -1612,11 +1690,31 @@ JointTrajectoryController::set_hold_position()
 }
 
 std::shared_ptr<trajectory_msgs::msg::JointTrajectory>
-JointTrajectoryController::set_success_trajectory_point()
+JointTrajectoryController::set_success_trajectory_point(const std::vector<bool> &reached_effort_limits)
 {
   // set last command to be repeated at success, no matter if it has nonzero velocity or
   // acceleration
   hold_position_msg_ptr_->points[0] = traj_external_point_ptr_->get_trajectory_msg()->points.back();
+  for (size_t i = 0; i < reached_effort_limits.size(); ++i)
+  {
+    if (reached_effort_limits[i])
+    {
+      // set effort to zero for joints that reached effort limits
+      hold_position_msg_ptr_->points[0].positions[i] = last_commanded_state_.positions[i];
+      if (has_velocity_command_interface_)
+      {
+        hold_position_msg_ptr_->points[0].velocities[i] = 0.0;
+      }
+      if (has_acceleration_command_interface_)
+      {
+        hold_position_msg_ptr_->points[0].accelerations[i] = 0.0;
+      }
+      if (has_effort_command_interface_)
+      {
+        hold_position_msg_ptr_->points[0].effort[i] = last_commanded_state_.effort[i];
+      }
+    }
+  }
   hold_position_msg_ptr_->points[0].time_from_start = rclcpp::Duration(0, 0);
 
   // set flag, otherwise tolerances will be checked with success_trajectory_point too

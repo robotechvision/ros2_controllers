@@ -107,6 +107,7 @@ protected:
   trajectory_msgs::msg::JointTrajectoryPoint command_current_;
   trajectory_msgs::msg::JointTrajectoryPoint state_desired_;
   trajectory_msgs::msg::JointTrajectoryPoint state_error_;
+  std::vector<rclcpp::Duration> state_joint_delays_;
 
   // Degrees of freedom
   size_t dof_;
@@ -135,6 +136,7 @@ protected:
   bool has_position_state_interface_ = false;
   bool has_velocity_state_interface_ = false;
   bool has_acceleration_state_interface_ = false;
+  bool has_effort_state_interface_ = false;
   bool has_position_command_interface_ = false;
   bool has_velocity_command_interface_ = false;
   bool has_acceleration_command_interface_ = false;
@@ -243,7 +245,7 @@ protected:
    * no matter if it has nonzero velocity or acceleration
    */
   JOINT_TRAJECTORY_CONTROLLER_PUBLIC
-  std::shared_ptr<trajectory_msgs::msg::JointTrajectory> set_success_trajectory_point();
+  std::shared_ptr<trajectory_msgs::msg::JointTrajectory> set_success_trajectory_point(const std::vector<bool> &reached_effort_limits);
 
   JOINT_TRAJECTORY_CONTROLLER_PUBLIC
   bool reset();

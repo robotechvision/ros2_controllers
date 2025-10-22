@@ -92,7 +92,8 @@ bool Trajectory::sample(
   const rclcpp::Time & sample_time,
   const interpolation_methods::InterpolationMethod interpolation_method,
   trajectory_msgs::msg::JointTrajectoryPoint & output_state,
-  TrajectoryPointConstIter & start_segment_itr, TrajectoryPointConstIter & end_segment_itr)
+  TrajectoryPointConstIter & start_segment_itr, TrajectoryPointConstIter & end_segment_itr,
+  const std::vector<rclcpp::Duration> &joint_delays)
 {
   THROW_ON_NULLPTR(trajectory_msg_)
 
@@ -151,43 +152,99 @@ bool Trajectory::sample(
 
   // time_from_start + trajectory time is the expected arrival time of trajectory
   const auto last_idx = trajectory_msg_->points.size() - 1;
-  for (size_t i = last_sample_idx_; i < last_idx; ++i)
-  {
-    auto & point = trajectory_msg_->points[i];
-    auto & next_point = trajectory_msg_->points[i + 1];
+  rclcpp::Duration min_delay = rclcpp::Duration::from_seconds(10000.0);
+  auto interpolate = [&](size_t search_start, size_t search_end, int joint_i, const rclcpp::Duration &delay) {
+    auto set_output_state = [&](const trajectory_msgs::msg::JointTrajectoryPoint &state) {
+      if (joint_i == -1)
+        output_state = state;
+      else {
+        if (!state.positions.empty()) {
+          output_state.positions.resize(state.positions.size(), 0.0);
+          output_state.positions[joint_i] = state.positions[joint_i];
+        }
+        if (!state.velocities.empty()) {
+          output_state.velocities.resize(state.velocities.size(), 0.0);
+          output_state.velocities[joint_i] = state.velocities[joint_i];
+        }
+        if (!state.accelerations.empty()) {
+          output_state.accelerations.resize(state.accelerations.size(), 0.0);
+          output_state.accelerations[joint_i] = state.accelerations[joint_i];
+        }
+        if (!state.effort.empty()) {
+          output_state.effort.resize(state.effort.size(), 0.0);
+          output_state.effort[joint_i] = state.effort[joint_i];
+        }
+      }
+    };
 
-    const rclcpp::Time t0 = trajectory_start_time_ + point.time_from_start;
-    const rclcpp::Time t1 = trajectory_start_time_ + next_point.time_from_start;
-
-    if (sample_time >= t0 && sample_time < t1)
+    auto sample_time_inner = sample_time - delay;
+    if (delay > rclcpp::Duration::from_seconds(0.0)) {
+      while (search_start > 0 && (sample_time_inner < trajectory_start_time_ + trajectory_msg_->points[search_start].time_from_start))
+        --search_start;
+      if (sample_time_inner < trajectory_start_time_ + trajectory_msg_->points[search_start].time_from_start) {
+        // before the start of the trajectory
+        set_output_state(state_before_traj_msg_);
+        if (delay < min_delay) {
+          min_delay = delay;
+          start_segment_itr = begin();
+          end_segment_itr = begin();
+        }
+        return;
+      }
+    }
+    for (size_t i = search_start; i < search_end; ++i)
     {
-      // If interpolation is disabled, just forward the next waypoint
-      if (interpolation_method == interpolation_methods::InterpolationMethod::NONE)
-      {
-        output_state = next_point;
-      }
-      // Do interpolation
-      else
-      {
-        // it changes points only if position and velocity do not exist, but their derivatives
-        deduce_from_derivatives(
-          point, next_point, state_before_traj_msg_.positions.size(), (t1 - t0).seconds());
+      auto & point = trajectory_msg_->points[i];
+      auto & next_point = trajectory_msg_->points[i + 1];
 
-        interpolate_between_points(t0, point, t1, next_point, sample_time, output_state);
+      const rclcpp::Time t0 = trajectory_start_time_ + point.time_from_start;
+      const rclcpp::Time t1 = trajectory_start_time_ + next_point.time_from_start;
+
+      if (sample_time_inner >= t0 && sample_time_inner < t1)
+      {
+        // If interpolation is disabled, just forward the next waypoint
+        if (interpolation_method == interpolation_methods::InterpolationMethod::NONE)
+        {
+          set_output_state(next_point);
+        }
+        // Do interpolation
+        else
+        {
+          // it changes points only if position and velocity do not exist, but their derivatives
+          deduce_from_derivatives(
+            point, next_point, state_before_traj_msg_.positions.size(), (t1 - t0).seconds(), joint_i);
+
+          interpolate_between_points(t0, point, t1, next_point, sample_time_inner, output_state, joint_i);
+        }
+        if (delay < min_delay) {
+          min_delay = delay;
+          start_segment_itr = begin() + static_cast<TrajectoryPointConstIter::difference_type>(i);
+          end_segment_itr = begin() + static_cast<TrajectoryPointConstIter::difference_type>(i + 1);
+          output_state.time_from_start.sec = (int32_t)((sample_time_inner - trajectory_start_time_).nanoseconds()/1000000000);
+          output_state.time_from_start.nanosec = (uint32_t)((sample_time_inner - trajectory_start_time_).nanoseconds()%1000000000);
+          last_sample_idx_ = i;
+        }
+        return;
       }
-      start_segment_itr = begin() + static_cast<TrajectoryPointConstIter::difference_type>(i);
-      end_segment_itr = begin() + static_cast<TrajectoryPointConstIter::difference_type>(i + 1);
-      output_state.time_from_start = next_point.time_from_start;
-      last_sample_idx_ = i;
-      return true;
+    }
+
+    // whole animation has played out
+    if (delay < min_delay) {
+      min_delay = delay;
+      start_segment_itr = --end();
+      end_segment_itr = end();
+      last_sample_idx_ = last_idx;
+    }
+    set_output_state(*start_segment_itr);
+  };
+  if (std::all_of(joint_delays.begin(), joint_delays.end(), [](const auto &d) { return d.seconds() == 0.0; }))
+    interpolate(last_sample_idx_, last_idx, -1, rclcpp::Duration::from_seconds(0.0));
+  else {
+    // per-joint delays
+    for (size_t joint_i = 0; joint_i < joint_delays.size(); ++joint_i) {
+      interpolate(last_sample_idx_, last_idx, static_cast<int>(joint_i), joint_delays[joint_i]);
     }
   }
-
-  // whole animation has played out
-  start_segment_itr = --end();
-  end_segment_itr = end();
-  last_sample_idx_ = last_idx;
-  output_state = (*start_segment_itr);
   // the trajectories in msg may have empty velocities/accel, so resize them
   if (output_state.velocities.empty())
   {
@@ -203,7 +260,8 @@ bool Trajectory::sample(
 void Trajectory::interpolate_between_points(
   const rclcpp::Time & time_a, const trajectory_msgs::msg::JointTrajectoryPoint & state_a,
   const rclcpp::Time & time_b, const trajectory_msgs::msg::JointTrajectoryPoint & state_b,
-  const rclcpp::Time & sample_time, trajectory_msgs::msg::JointTrajectoryPoint & output)
+  const rclcpp::Time & sample_time, trajectory_msgs::msg::JointTrajectoryPoint & output,
+  int joint_i)
 {
   rclcpp::Duration duration_so_far = sample_time - time_a;
   rclcpp::Duration duration_btwn_points = time_b - time_a;
@@ -238,10 +296,12 @@ void Trajectory::interpolate_between_points(
   double t[6];
   generate_powers(5, duration_so_far.seconds(), t);
 
+  size_t start_idx = joint_i == -1 ? 0 : static_cast<size_t>(joint_i);
+  size_t end_idx = joint_i == -1 ? dim : static_cast<size_t>(joint_i + 1);
   if (!has_velocity && !has_accel)
   {
     // do linear interpolation
-    for (size_t i = 0; i < dim; ++i)
+    for (size_t i = start_idx; i < end_idx; ++i)
     {
       double start_pos = state_a.positions[i];
       double end_pos = state_b.positions[i];
@@ -263,7 +323,7 @@ void Trajectory::interpolate_between_points(
     double T[4];
     generate_powers(3, duration_btwn_points.seconds(), T);
 
-    for (size_t i = 0; i < dim; ++i)
+    for (size_t i = start_idx; i < end_idx; ++i)
     {
       double start_pos = state_a.positions[i];
       double start_vel = state_a.velocities[i];
@@ -294,7 +354,7 @@ void Trajectory::interpolate_between_points(
     double T[6];
     generate_powers(5, duration_btwn_points.seconds(), T);
 
-    for (size_t i = 0; i < dim; ++i)
+    for (size_t i = start_idx; i < end_idx; ++i)
     {
       double start_pos = state_a.positions[i];
       double start_vel = state_a.velocities[i];
@@ -330,22 +390,46 @@ void Trajectory::interpolate_between_points(
                                 t[2] * 12.0 * coefficients[4] + t[3] * 20.0 * coefficients[5];
     }
   }
+  bool has_effort = !state_a.effort.empty() && !state_b.effort.empty();
+  if (has_effort)
+  {
+    const size_t dim_effort = state_a.effort.size();
+    output.effort.resize(dim_effort, 0.0);
+    start_idx = joint_i == -1 ? 0 : static_cast<size_t>(joint_i);
+    end_idx = joint_i == -1 ? static_cast<size_t>(dim_effort) : std::min(static_cast<size_t>(joint_i + 1), dim_effort);
+    // do linear interpolation
+    for (size_t i = start_idx; i < end_idx; ++i)
+    {
+      double start_effort = state_a.effort[i];
+      double end_effort = state_b.effort[i];
+
+      double coefficients[2] = {0.0, 0.0};
+      coefficients[0] = start_effort;
+      if (duration_btwn_points.seconds() != 0.0)
+      {
+        coefficients[1] = (end_effort - start_effort) / duration_btwn_points.seconds();
+      }
+
+      output.effort[i] = t[0] * coefficients[0] + t[1] * coefficients[1];
+    }
+  }
 }
 
 void Trajectory::deduce_from_derivatives(
   trajectory_msgs::msg::JointTrajectoryPoint & first_state,
-  trajectory_msgs::msg::JointTrajectoryPoint & second_state, const size_t dim, const double delta_t)
+  trajectory_msgs::msg::JointTrajectoryPoint & second_state, const size_t dim, const double delta_t,
+  int joint_i)
 {
-  if (second_state.positions.empty())
+  if (second_state.positions.empty() || (joint_i != -1 && !std::isfinite(second_state.positions[joint_i])))
   {
-    second_state.positions.resize(dim);
+    second_state.positions.resize(dim, joint_i == -1 ? 0.0 : std::numeric_limits<double>::infinity());
     if (first_state.velocities.empty())
     {
       first_state.velocities.resize(dim, 0.0);
     }
-    if (second_state.velocities.empty())
+    if (second_state.velocities.empty() || (joint_i != -1 && !std::isfinite(second_state.velocities[joint_i])))
     {
-      second_state.velocities.resize(dim);
+      second_state.velocities.resize(dim, joint_i == -1 ? 0.0 : std::numeric_limits<double>::infinity());
       if (first_state.accelerations.empty())
       {
         first_state.accelerations.resize(dim, 0.0);

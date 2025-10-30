@@ -297,7 +297,7 @@ SegmentTolerances get_segment_tolerances(
  */
 inline bool check_state_tolerance_per_joint(
   const trajectory_msgs::msg::JointTrajectoryPoint & state_error, size_t joint_idx,
-  const StateTolerances & state_tolerance, bool show_errors = false)
+  const StateTolerances & state_tolerance, bool show_errors = false, bool verbose = false)
 {
   using std::abs;
   const double error_position = state_error.positions[joint_idx];
@@ -313,6 +313,14 @@ inline bool check_state_tolerance_per_joint(
 
   if (is_valid)
   {
+    if (verbose)
+    {
+      RCLCPP_INFO(
+        rclcpp::get_logger("tolerances"), "State tolerances passed for joint %d:\n pos %lf < %lf, vel %lf < %lf, acc %lf < %lf", joint_idx,
+        error_position, state_tolerance.position,
+        error_velocity, state_tolerance.velocity,
+        error_acceleration, state_tolerance.acceleration);
+    }
     return true;
   }
 

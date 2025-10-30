@@ -254,7 +254,7 @@ controller_interface::return_type JointTrajectoryController::update(
 
       bool all_effort_limits_reached = has_effort_state_interface_ && state_desired_.effort.size() == dof_;
       if (all_effort_limits_reached && !rt_is_holding_)
-        RCLCPP_INFO_STREAM(LOGGER, "State desired:\n" << trajectory_msgs::msg::to_yaml(state_desired_) << "\n"
+        RCLCPP_DEBUG_STREAM(LOGGER, "State desired:\n" << trajectory_msgs::msg::to_yaml(state_desired_) << "\n"
                                                       << "State current:\n" << trajectory_msgs::msg::to_yaml(state_current_));
       std::vector<bool> reached_effort_limits(dof_, false);
       // Check state/goal tolerance
@@ -269,7 +269,7 @@ controller_interface::return_type JointTrajectoryController::update(
                 state_current_.effort[index] < state_desired_.effort[index])
           {
             reached_effort_limits[index] = true;
-            RCLCPP_INFO(
+            RCLCPP_DEBUG(
               logger,
               "Effort limit exceeded on joint '%s': current effort %lf (limit %lf). Freezing "
               "desired state for this joint. Delay: %lf + (%lf - %lf) = %lf",
@@ -318,7 +318,7 @@ controller_interface::return_type JointTrajectoryController::update(
         if (
           !before_last_point && !rt_is_holding_ && !reached_effort_limits[index] &&
           !check_state_tolerance_per_joint(
-            state_error_, index, active_tol->goal_state_tolerance[index], false /* show_errors */))
+            state_error_, index, active_tol->goal_state_tolerance[index], false /* show_errors */, false))
         {
           outside_goal_tolerance = true;
           // RCLCPP_INFO(logger, "Time difference: %lf / %lf", time_difference, active_tol->goal_time_tolerance);
@@ -337,7 +337,7 @@ controller_interface::return_type JointTrajectoryController::update(
         }
       }
       // if all effort limits are reached, we consider the goal reached
-      if (all_effort_limits_reached)
+      if (active_goal && all_effort_limits_reached)
       {
         RCLCPP_INFO(logger, "All effort limits reached. Considering goal reached.");
       }
@@ -1661,7 +1661,7 @@ void JointTrajectoryController::add_new_trajectory_msg(
   traj_msg_external_point_ptr_.writeFromNonRT(traj_msg);
   for (auto &state_delay : state_joint_delays_)
     state_delay = rclcpp::Duration::from_seconds(0);
-  RCLCPP_INFO_STREAM(LOGGER, "New traj\n" << trajectory_msgs::msg::to_yaml(*traj_msg));
+  RCLCPP_DEBUG_STREAM(LOGGER, "New traj\n" << trajectory_msgs::msg::to_yaml(*traj_msg));
 }
 
 void JointTrajectoryController::preempt_active_goal()
